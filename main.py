@@ -16,6 +16,9 @@ from pydantic import BaseModel, Field
 from data_fetcher import get_exchange_rate, get_macro_indicators
 from logic import analyze_macro_impact
 
+import os
+import uvicorn
+
 # -----------------------------------------------------------------------------
 # FastAPI アプリケーション
 # -----------------------------------------------------------------------------
@@ -113,3 +116,8 @@ async def analyze(news: AnalyzeRequest) -> dict[str, Any]:
         "market_data": market_data,
         "timestamp": datetime.now().isoformat(),
     }
+
+if __name__ == "__main__":
+    # 環境変数 PORT があればそれを使い、なければ 8000 を使う（ローカル用）
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
