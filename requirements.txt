@@ -57,3 +57,5 @@ websockets==15.0.1
 wrapt==1.17.3
 yfinance==1.2.0
 zipp==3.23.0
+gunicorn==23.0.0
+fredapi==0.5.2
