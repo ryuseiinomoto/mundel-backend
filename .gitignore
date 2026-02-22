@@ -1,0 +1,11 @@
+# Python 仮想環境
+venv/
+.venv/
+env/
+
+# キャッシュファイル
+__pycache__/
+*.py[cod]
+
+# 環境変数（APIキーなど）
+.env
