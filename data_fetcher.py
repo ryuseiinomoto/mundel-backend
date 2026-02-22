@@ -27,7 +27,7 @@ FRED_API_KEY = os.getenv("FRED_API_KEY")
 FRED_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
 
 # data/ ディレクトリと SQLite DB のパス
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DATA_DIR = Path("/tmp/mundel_data")
 DB_PATH = DATA_DIR / "mundel_cache.db"
 CACHE_TTL_SECONDS = 3600  # 1時間
 
