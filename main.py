@@ -28,7 +28,7 @@ app = FastAPI(
 # v0 / React / Next.js からのアクセスを許可
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # 本番では特定オリジンに制限推奨
+    allow_origins=["*"],  # 本番では特定オリジンに制限推奨
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
