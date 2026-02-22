@@ -20,8 +20,8 @@ from dotenv import load_dotenv
 # -----------------------------------------------------------------------------
 # 環境変数の読み込み
 # -----------------------------------------------------------------------------
-_env_path = Path(__file__).resolve().parent.parent / ".env"
-load_dotenv(_env_path)
+
+load_dotenv()
 
 FRED_API_KEY = os.getenv("FRED_API_KEY")
 FRED_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
