@@ -14,10 +14,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from data_fetcher import get_exchange_rate, get_macro_indicators
-from logic import analyze_macro_impact
+from logic import analyze_macro_impact_with_integrated_data
 
 import os
 import uvicorn
+
+from calendar_logic import get_today_economic_calendar
 
 # -----------------------------------------------------------------------------
 # FastAPI アプリケーション
@@ -66,19 +68,21 @@ async def analyze(news: AnalyzeRequest) -> dict[str, Any]:
     """
     news_text = news.news_text.strip()
 
-    # 3つの処理を並行実行（同期関数は to_thread で実行）
+    # 統合データを用いた分析 + 市場データを並行実行
     analysis_result, exchange_result, macro_result = await asyncio.gather(
-        asyncio.to_thread(analyze_macro_impact, news_text),
+        asyncio.to_thread(analyze_macro_impact_with_integrated_data, news_text),
         asyncio.to_thread(get_exchange_rate, "USDJPY=X"),
         asyncio.to_thread(get_macro_indicators),
         return_exceptions=True,
     )
 
-    # 分析結果の正規化（例外時は error 付きで格納）
+    # 分析結果の正規化（統合分析は analysis + economic_calendar を返す）
+    economic_calendar: list = []
     if isinstance(analysis_result, Exception):
         analysis = {"error": str(analysis_result)}
     else:
-        analysis = analysis_result
+        analysis = analysis_result.get("analysis", analysis_result)
+        economic_calendar = analysis_result.get("economic_calendar", [])
 
     # 市場データの統合
     market_data: dict[str, Any] = {
@@ -114,6 +118,7 @@ async def analyze(news: AnalyzeRequest) -> dict[str, Any]:
     return {
         "analysis": analysis,
         "market_data": market_data,
+        "economic_calendar": economic_calendar,
         "timestamp": datetime.now().isoformat(),
     }
 
@@ -121,3 +126,7 @@ if __name__ == "__main__":
     # 環境変数 PORT があればそれを使い、なければ 8000 を使う（ローカル用）
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+@app.get("/api/calendar")
+def read_calendar():
+    return get_today_economic_calendar()
