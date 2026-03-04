@@ -116,6 +116,114 @@ TRADING_ECONOMICS_API_KEY = os.getenv("TRADING_ECONOMICS_API_KEY")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 TE_BASE = "https://api.tradingeconomics.com"
 
+# フォールバック値（Trading Economics API 取得失敗時）
+FALLBACK_USD_JPY = 150.0
+FALLBACK_US_POLICY_RATE = 4.0
+FALLBACK_US_CPI_YOY = 3.0
+
+
+def get_te_macro_snapshot() -> dict[str, Any]:
+    """
+    Trading Economics API から以下を取得する:
+    - 最新の USD/JPY レート
+    - アメリカの政策金利（Fed Funds Rate）
+    - アメリカの CPI（前年比 / YoY）
+
+    取得失敗時はフォールバック値を返す。
+    """
+    result: dict[str, Any] = {
+        "usd_jpy": FALLBACK_USD_JPY,
+        "us_policy_rate": FALLBACK_US_POLICY_RATE,
+        "us_cpi_yoy": FALLBACK_US_CPI_YOY,
+        "usd_jpy_source": None,
+        "us_policy_rate_source": None,
+        "us_cpi_yoy_source": None,
+        "errors": [],
+    }
+
+    if not TRADING_ECONOMICS_API_KEY:
+        result["errors"].append("TRADING_ECONOMICS_API_KEY が未設定です")
+        return result
+
+    params = {"c": TRADING_ECONOMICS_API_KEY}
+
+    # USD/JPY: markets/currency?cross=JPY
+    try:
+        url = f"{TE_BASE}/markets/currency"
+        resp = requests.get(url, params={**params, "cross": "JPY"}, timeout=15)
+        resp.raise_for_status()
+        raw = resp.json()
+        items = raw if isinstance(raw, list) else []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            sym = (item.get("Symbol") or "").upper()
+            name = (item.get("Name") or "").upper()
+            if ("USD" in sym and "JPY" in sym) or ("USD" in name and "JPY" in name):
+                val = item.get("Last") or item.get("Close")
+                if val is not None:
+                    try:
+                        result["usd_jpy"] = float(val)
+                        result["usd_jpy_source"] = "Trading Economics"
+                        break
+                    except (TypeError, ValueError):
+                        pass
+    except Exception as e:
+        logger.warning("Trading Economics USD/JPY 取得失敗: %s", e)
+        result["errors"].append(f"USD/JPY: {e}")
+
+    # 米国指標: country/united states
+    try:
+        url = f"{TE_BASE}/country/united%20states"
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        raw = resp.json()
+        items = raw if isinstance(raw, list) else []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            cat = (item.get("Category") or "").lower()
+            title = (item.get("Title") or "").lower()
+            val = item.get("LatestValue")
+            if val is None:
+                continue
+            try:
+                num_val = float(val)
+            except (TypeError, ValueError):
+                continue
+            if "interest rate" in cat or "interest rate" in title or "fed funds" in cat or "fed funds" in title:
+                result["us_policy_rate"] = num_val
+                result["us_policy_rate_source"] = "Trading Economics"
+            if (
+                ("consumer price index" in cat and ("yoy" in cat or "year" in cat))
+                or ("inflation" in cat and "cpi" in title)
+                or "consumer price index yoy" in cat
+            ):
+                result["us_cpi_yoy"] = num_val
+                result["us_cpi_yoy_source"] = "Trading Economics"
+        if result["us_cpi_yoy_source"] is None:
+            for item in items or []:
+                if not isinstance(item, dict):
+                    continue
+                cat = (item.get("Category") or "").lower()
+                val = item.get("LatestValue")
+                if val is None:
+                    continue
+                try:
+                    num_val = float(val)
+                except (TypeError, ValueError):
+                    continue
+                if "inflation" in cat:
+                    result["us_cpi_yoy"] = num_val
+                    result["us_cpi_yoy_source"] = "Trading Economics"
+                    break
+    except Exception as e:
+        logger.warning("Trading Economics 米国指標取得失敗: %s", e)
+        result["errors"].append(f"US indicators: {e}")
+
+    return result
+
+
 def _sort_and_limit_events(events: list) -> list:
     """重要度（Importance: 3=高, 2=中, 1=低）でソートし、最大30件に制限"""
     def key(e):
