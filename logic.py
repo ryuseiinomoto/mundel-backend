@@ -20,6 +20,7 @@ from google.genai import types
 from langfuse import Langfuse, observe
 import requests
 from newsapi import NewsApiClient
+from data_fetcher import get_exchange_rate
 
 logger = logging.getLogger(__name__)
 
@@ -124,8 +125,8 @@ FALLBACK_US_CPI_YOY = 3.0
 
 def get_te_macro_snapshot() -> dict[str, Any]:
     """
-    Trading Economics API から以下を取得する:
-    - 最新の USD/JPY レート
+    以下を取得する:
+    - 最新の USD/JPY レート（yfinance 経由）
     - アメリカの政策金利（Fed Funds Rate）
     - アメリカの CPI（前年比 / YoY）
 
@@ -141,36 +142,27 @@ def get_te_macro_snapshot() -> dict[str, Any]:
         "errors": [],
     }
 
+    # USD/JPY: yfinance（data_fetcher.get_exchange_rate）で取得
+    try:
+        fx = get_exchange_rate("USDJPY=X")
+        price = fx.get("current_price")
+        if isinstance(price, (int, float)):
+            result["usd_jpy"] = float(price)
+            result["usd_jpy_source"] = "yfinance"
+        elif fx.get("error"):
+            result["errors"].append(f"USD/JPY (yfinance): {fx['error']}")
+    except Exception as e:
+        logger.warning("yfinance USD/JPY 取得失敗: %s", e)
+        result["errors"].append(f"USD/JPY (yfinance): {e}")
+
+    # 以下、金利・CPI は Trading Economics を継続利用
+
     if not TRADING_ECONOMICS_API_KEY:
+        # TE キーが無くても、USD/JPY は yfinance で取得済みなのでそのまま返す
         result["errors"].append("TRADING_ECONOMICS_API_KEY が未設定です")
         return result
 
     params = {"c": TRADING_ECONOMICS_API_KEY}
-
-    # USD/JPY: markets/currency?cross=JPY
-    try:
-        url = f"{TE_BASE}/markets/currency"
-        resp = requests.get(url, params={**params, "cross": "JPY"}, timeout=15)
-        resp.raise_for_status()
-        raw = resp.json()
-        items = raw if isinstance(raw, list) else []
-        for item in items or []:
-            if not isinstance(item, dict):
-                continue
-            sym = (item.get("Symbol") or "").upper()
-            name = (item.get("Name") or "").upper()
-            if ("USD" in sym and "JPY" in sym) or ("USD" in name and "JPY" in name):
-                val = item.get("Last") or item.get("Close")
-                if val is not None:
-                    try:
-                        result["usd_jpy"] = float(val)
-                        result["usd_jpy_source"] = "Trading Economics"
-                        break
-                    except (TypeError, ValueError):
-                        pass
-    except Exception as e:
-        logger.warning("Trading Economics USD/JPY 取得失敗: %s", e)
-        result["errors"].append(f"USD/JPY: {e}")
 
     # 米国指標: country/united states
     try:
