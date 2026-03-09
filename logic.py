@@ -69,19 +69,16 @@ MACRO_IMPACT_SCHEMA = {
     "required": ["is_shift", "lm_shift", "bp_shift", "logic_jp"],
     "properties": {
         "is_shift": {
-            "type": "string",
-            "enum": ["right", "left", "none"],
-            "description": "IS曲線のシフト方向",
+            "type": "number",
+            "description": "IS曲線の予測シフト量。正=右シフト、負=左シフト。範囲 -10.0 〜 10.0",
         },
         "lm_shift": {
-            "type": "string",
-            "enum": ["right", "left", "none"],
-            "description": "LM曲線のシフト方向",
+            "type": "number",
+            "description": "LM曲線の予測シフト量。正=右シフト、負=左シフト。範囲 -10.0 〜 10.0",
         },
         "bp_shift": {
-            "type": "string",
-            "enum": ["upward", "downward", "none"],
-            "description": "BP曲線のシフト方向",
+            "type": "number",
+            "description": "BP曲線の予測シフト量。正=上シフト、負=下シフト。範囲 -10.0 〜 10.0",
         },
         "logic_jp": {
             "type": "string",
@@ -94,21 +91,52 @@ SYSTEM_INSTRUCTION = (
     "あなたはマクロ経済学と外国為替市場の専門家です。"
     "入力されたニュースについて、マンデル＝フレミング・モデルにおける"
     "IS曲線・LM曲線・BP曲線への影響を分析し、指定されたJSON形式で出力してください。"
+    "is_shift, lm_shift, bp_shift は -10.0 〜 10.0 の数値で、ニュースの影響の大きさを表します。"
+    "影響が強いほど絶対値が大きく、影響がなければ 0 にしてください。"
 )
 
 USER_PROMPT_TEMPLATE = """
 以下のニュースを分析し、マンデル＝フレミング・モデルにおける
-IS曲線・LM曲線・BP曲線がどの方向にシフトするかを判定してください。
+IS曲線・LM曲線・BP曲線の予測シフト量を数値で判定してください。
 
 【ニュース】
 {news_text}
 
-上記のJSON形式で、以下のルールに従って厳格に出力してください：
-- is_shift: IS曲線のシフト（right / left / none）
-- lm_shift: LM曲線のシフト（right / left / none）
-- bp_shift: BP曲線のシフト（upward / downward / none）
-- logic_jp: 日本語での詳細な経済学的解説。IS-LM-BPのどれがなぜ動いたか、利子率と為替への影響を説明してください。
+【返すべきJSON形式】
+必ず以下の形式のJSONオブジェクトを1つだけ出力してください。各フィールドは数値または文字列で、型を厳守してください。
+
+{{
+  "is_shift": 数値,   // -10.0 〜 10.0（右シフト=正、左シフト=負、なし=0）
+  "lm_shift": 数値,   // -10.0 〜 10.0（右シフト=正、左シフト=負、なし=0）
+  "bp_shift": 数値,   // -10.0 〜 10.0（上シフト=正、下シフト=負、なし=0）
+  "logic_jp": "日本語での経済学的解説"
+}}
+
+【ルール】
+- is_shift, lm_shift, bp_shift は必ず数値（-10.0 〜 10.0）で出力してください。文字列や null は不可。
+- 影響が強いほど絶対値を大きく、影響がなければ 0 にしてください。
+- logic_jp は日本語で、IS-LM-BPのどれがなぜ動いたか、利子率と為替への影響を説明してください。
 """
+
+
+def compute_equilibrium(is_delta: float, lm_delta: float, _bp_delta: float) -> dict[str, float]:
+    """
+    IS-LM モデルにおける均衡点 (Y*, r*) を算出する。
+    フロントエンドの buildCurves と同じ係数を使用。
+    BP は IS-LM 交点には影響しないため未使用。
+
+    Returns:
+        {"y": float, "r": float}  # Y軸=所得、r軸=利子率
+    """
+    # IS: r = 7 - 0.05Y + is*0.7
+    # LM: r = 3 + 0.05Y + lm*0.7
+    # 交点: 7 - 0.05Y + is*0.7 = 3 + 0.05Y + lm*0.7
+    # 4 + 0.7*(is - lm) = 0.1Y  =>  Y = 40 + 7*(is - lm)
+    y_eq = 40.0 + 7.0 * (is_delta - lm_delta)
+    y_eq = max(0.0, min(100.0, y_eq))
+    r_eq = 7.0 - 0.05 * y_eq + is_delta * 0.7
+    r_eq = max(0.0, min(10.0, r_eq))
+    return {"y": round(y_eq, 2), "r": round(r_eq, 2)}
 
 # -----------------------------------------------------------------------------
 # 統合市場データ取得（経済指標カレンダー + NewsAPI）
@@ -348,11 +376,16 @@ def generate_analysis_prompt(
                 parts.append(f"   {desc[:150]}...")
         parts.append("")
 
-    parts.append("上記のJSON形式で、以下のルールに従って厳格に出力してください：")
-    parts.append("- is_shift: IS曲線のシフト（right / left / none）")
-    parts.append("- lm_shift: LM曲線のシフト（right / left / none）")
-    parts.append("- bp_shift: BP曲線のシフト（upward / downward / none）")
-    parts.append("- logic_jp: 日本語での詳細な経済学的解説。IS-LM-BPのどれがなぜ動いたか、利子率と為替への影響を説明してください。")
+    parts.append("【返すべきJSON形式】")
+    parts.append("必ず以下の形式のJSONオブジェクトを1つだけ出力してください。")
+    parts.append('{"is_shift": 数値, "lm_shift": 数値, "bp_shift": 数値, "logic_jp": "解説文"}')
+    parts.append("")
+    parts.append("【ルール】")
+    parts.append("- is_shift, lm_shift, bp_shift は必ず数値（各 -10.0 〜 10.0）で出力。文字列や null は不可。")
+    parts.append("- is_shift: IS曲線の予測シフト量。右シフト=正、左シフト=負、なし=0。")
+    parts.append("- lm_shift: LM曲線の予測シフト量。右シフト=正、左シフト=負、なし=0。")
+    parts.append("- bp_shift: BP曲線の予測シフト量。上シフト=正、下シフト=負、なし=0。")
+    parts.append("- logic_jp: 日本語での詳細な経済学的解説。IS-LM-BPのどれがなぜ動いたか、利子率と為替への影響を説明。")
     return "\n".join(parts)
 
 
@@ -367,10 +400,10 @@ def analyze_macro_impact(news_text: str) -> dict:
 
     Returns:
         {
-            "is_shift": "right" | "left" | "none",
-            "lm_shift": "right" | "left" | "none",
-            "bp_shift": "upward" | "downward" | "none",
-            "logic_jp": "日本語での詳細な経済学的解説"
+            "is_shift": float,  # -10.0 〜 10.0
+            "lm_shift": float,
+            "bp_shift": float,
+            "logic_jp": str
         }
 
     Raises:
@@ -476,6 +509,17 @@ def analyze_macro_impact_with_integrated_data(news_text: str) -> dict[str, Any]:
             f"Gemini API の応答に必須キーが含まれていません: {missing}\n"
             f"応答内容: {result}"
         )
+
+    def clamp_shift(v: Any) -> float:
+        try:
+            n = float(v)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(-10.0, min(10.0, n))
+
+    result["is_shift"] = clamp_shift(result.get("is_shift", 0))
+    result["lm_shift"] = clamp_shift(result.get("lm_shift", 0))
+    result["bp_shift"] = clamp_shift(result.get("bp_shift", 0))
 
     langfuse.flush()
 

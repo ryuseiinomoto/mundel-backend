@@ -19,6 +19,7 @@ from logic import (
     FALLBACK_US_POLICY_RATE,
     FALLBACK_USD_JPY,
     analyze_macro_impact_with_integrated_data,
+    compute_equilibrium,
     get_te_macro_snapshot,
 )
 
@@ -53,6 +54,33 @@ class AnalyzeRequest(BaseModel):
     """POST /api/analyze のリクエストボディ"""
 
     news_text: str = Field(..., min_length=1, description="分析対象のニューステキスト")
+
+
+class EquilibriumPoint(BaseModel):
+    """均衡点 (Y, r)"""
+
+    y: float = Field(..., description="均衡所得")
+    r: float = Field(..., description="均衡利子率")
+
+
+class AnalyzeResponse(BaseModel):
+    """POST /api/analyze のレスポンス（フロントエンドが確実に受け取れるよう数値型を保証）"""
+
+    analysis: dict[str, Any] = Field(default_factory=dict)
+    market_data: dict[str, Any] = Field(default_factory=dict)
+    economic_calendar: list = Field(default_factory=list)
+    te_macro_snapshot: dict[str, Any] = Field(default_factory=dict)
+    is_shift: float = Field(0.0, ge=-10.0, le=10.0, description="IS曲線シフト量")
+    lm_shift: float = Field(0.0, ge=-10.0, le=10.0, description="LM曲線シフト量")
+    bp_shift: float = Field(0.0, ge=-10.0, le=10.0, description="BP曲線シフト量")
+    equilibrium_e0: EquilibriumPoint = Field(..., description="現在の均衡点")
+    equilibrium_e1: EquilibriumPoint = Field(..., description="シフト後の均衡点")
+    predicted_equilibrium: EquilibriumPoint = Field(..., description="予測均衡点（equilibrium_e1 と同じ）")
+    shifts_delta: dict[str, float] = Field(
+        ...,
+        description="シフト量 (is, lm, bp)。フロントエンド互換のため is キーを使用",
+    )
+    timestamp: str = Field(default="")
 
 
 # -----------------------------------------------------------------------------
@@ -138,13 +166,13 @@ async def get_analysis() -> dict[str, Any]:
     }
 
 
-@app.post("/api/analyze")
-async def analyze(news: AnalyzeRequest) -> dict[str, Any]:
+@app.post("/api/analyze", response_model=AnalyzeResponse)
+async def analyze(news: AnalyzeRequest) -> AnalyzeResponse:
     """
     ニュースを分析し、AI分析結果と市場データを統合して返却する。
 
     - analyze_macro_impact と市場データ取得（為替・マクロ指標）を並行実行
-    - いずれかが失敗しても、エラーを含めてレスポンスを返しクラッシュしない
+    - is_shift, lm_shift, bp_shift, predicted_equilibrium は必ず数値で返却
     """
     news_text = news.news_text.strip()
 
@@ -216,13 +244,36 @@ async def analyze(news: AnalyzeRequest) -> dict[str, Any]:
             "errors": te_snapshot_result.get("errors", []),
         }
 
-    return {
-        "analysis": analysis,
-        "market_data": market_data,
-        "economic_calendar": economic_calendar,
-        "te_macro_snapshot": te_macro,
-        "timestamp": datetime.now().isoformat(),
-    }
+    # 均衡点 E0（現在）と E1（シフト後予測）を算出（必ず数値で返す）
+    def to_float(v: Any, default: float = 0.0) -> float:
+        try:
+            return float(v) if v is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    def clamp(v: float) -> float:
+        return max(-10.0, min(10.0, v))
+
+    is_d = clamp(to_float(analysis.get("is_shift"), 0.0))
+    lm_d = clamp(to_float(analysis.get("lm_shift"), 0.0))
+    bp_d = clamp(to_float(analysis.get("bp_shift"), 0.0))
+    eq0 = compute_equilibrium(0.0, 0.0, 0.0)
+    eq1 = compute_equilibrium(is_d, lm_d, bp_d)
+
+    return AnalyzeResponse(
+        analysis=analysis,
+        market_data=market_data,
+        economic_calendar=economic_calendar,
+        te_macro_snapshot=te_macro,
+        is_shift=is_d,
+        lm_shift=lm_d,
+        bp_shift=bp_d,
+        equilibrium_e0=EquilibriumPoint(y=eq0["y"], r=eq0["r"]),
+        equilibrium_e1=EquilibriumPoint(y=eq1["y"], r=eq1["r"]),
+        predicted_equilibrium=EquilibriumPoint(y=eq1["y"], r=eq1["r"]),
+        shifts_delta={"is": is_d, "lm": lm_d, "bp": bp_d},
+        timestamp=datetime.now().isoformat(),
+    )
 
 if __name__ == "__main__":
     # 環境変数 PORT があればそれを使い、なければ 8000 を使う（ローカル用）
