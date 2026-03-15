@@ -63,6 +63,15 @@ class EquilibriumPoint(BaseModel):
     r: float = Field(..., description="均衡利子率")
 
 
+class MacroEffects(BaseModel):
+    """マクロ経済指標への予測影響"""
+
+    exchange_rate: str = Field("Neutral", description="為替への影響")
+    interest_rate: str = Field("Neutral", description="利子率への影響")
+    output: str = Field("Neutral", description="産出・所得への影響")
+    capital_flow: str = Field("Neutral", description="資本フローへの影響")
+
+
 class AnalyzeResponse(BaseModel):
     """POST /api/analyze のレスポンス（フロントエンドが確実に受け取れるよう数値型を保証）"""
 
@@ -79,6 +88,10 @@ class AnalyzeResponse(BaseModel):
     shifts_delta: dict[str, float] = Field(
         ...,
         description="シフト量 (is, lm, bp)。フロントエンド互換のため is キーを使用",
+    )
+    macro_effects: MacroEffects = Field(
+        default_factory=lambda: MacroEffects(),
+        description="為替・利子率・産出・資本フローへの予測影響",
     )
     timestamp: str = Field(default="")
 
@@ -260,6 +273,32 @@ async def analyze(news: AnalyzeRequest) -> AnalyzeResponse:
     eq0 = compute_equilibrium(0.0, 0.0, 0.0)
     eq1 = compute_equilibrium(is_d, lm_d, bp_d)
 
+    # macro_effects: AI の分析結果から取得、なければシフト量から推定
+    def _str(v: Any, default: str = "Neutral") -> str:
+        s = str(v).strip() if v is not None else ""
+        return s if s else default
+
+    def _derive_from_shifts(iso: float, lmo: float, bpo: float) -> MacroEffects:
+        """IS-LM-BP シフトからマクロ影響を簡易推定"""
+        y_delta = iso - lmo
+        return MacroEffects(
+            exchange_rate="Appreciation" if bpo > 0.5 else ("Depreciation" if bpo < -0.5 else "Neutral"),
+            interest_rate="Increase" if iso > 0.5 or lmo < -0.5 else ("Decrease" if iso < -0.5 or lmo > 0.5 else "Neutral"),
+            output="Expand" if y_delta > 0.5 else ("Contract" if y_delta < -0.5 else "Neutral"),
+            capital_flow="Inflow" if bpo > 0.5 else ("Outflow" if bpo < -0.5 else "Neutral"),
+        )
+
+    me_raw = analysis.get("macro_effects") or {}
+    if isinstance(me_raw, dict) and any(me_raw.get(k) for k in ("exchange_rate", "interest_rate", "output", "capital_flow")):
+        me = MacroEffects(
+            exchange_rate=_str(me_raw.get("exchange_rate")),
+            interest_rate=_str(me_raw.get("interest_rate")),
+            output=_str(me_raw.get("output")),
+            capital_flow=_str(me_raw.get("capital_flow")),
+        )
+    else:
+        me = _derive_from_shifts(is_d, lm_d, bp_d)
+
     return AnalyzeResponse(
         analysis=analysis,
         market_data=market_data,
@@ -272,6 +311,7 @@ async def analyze(news: AnalyzeRequest) -> AnalyzeResponse:
         equilibrium_e1=EquilibriumPoint(y=eq1["y"], r=eq1["r"]),
         predicted_equilibrium=EquilibriumPoint(y=eq1["y"], r=eq1["r"]),
         shifts_delta={"is": is_d, "lm": lm_d, "bp": bp_d},
+        macro_effects=me,
         timestamp=datetime.now().isoformat(),
     )
 
