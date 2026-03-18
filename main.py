@@ -8,8 +8,9 @@ FastAPI でフロントエンド（v0 / React / Next.js）と接続する。
 import asyncio
 from datetime import datetime
 from typing import Any
+import uuid
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -21,10 +22,12 @@ from logic import (
     analyze_macro_impact_with_integrated_data,
     compute_equilibrium,
     get_te_macro_snapshot,
+    fx_chat_response,
 )
 
 import os
 import uvicorn
+import yfinance as yf
 
 from calendar_logic import get_today_economic_calendar
 
@@ -93,7 +96,25 @@ class AnalyzeResponse(BaseModel):
         default_factory=lambda: MacroEffects(),
         description="為替・利子率・産出・資本フローへの予測影響",
     )
+    signal: str = Field("HOLD", description="売買シグナル: BUY | SELL | HOLD")
+    signal_reason: str = Field("", description="シグナルの根拠（日本語）")
     timestamp: str = Field(default="")
+
+
+# -----------------------------------------------------------------------------
+# トレード状態（インメモリ）
+# -----------------------------------------------------------------------------
+INITIAL_BALANCE = 10000.0
+
+_trade_state: dict[str, Any] = {
+    "balance": INITIAL_BALANCE,
+    "positions": [],
+}
+
+
+class TradeRequest(BaseModel):
+    action: str = Field(..., description="BUY または SELL")
+    quantity: float = Field(..., gt=0, description="取引数量（USD）")
 
 
 # -----------------------------------------------------------------------------
@@ -299,6 +320,11 @@ async def analyze(news: AnalyzeRequest) -> AnalyzeResponse:
     else:
         me = _derive_from_shifts(is_d, lm_d, bp_d)
 
+    signal = str(analysis.get("signal") or "HOLD").upper()
+    if signal not in ("BUY", "SELL", "HOLD"):
+        signal = "HOLD"
+    signal_reason = str(analysis.get("signal_reason") or "")
+
     return AnalyzeResponse(
         analysis=analysis,
         market_data=market_data,
@@ -312,14 +338,169 @@ async def analyze(news: AnalyzeRequest) -> AnalyzeResponse:
         predicted_equilibrium=EquilibriumPoint(y=eq1["y"], r=eq1["r"]),
         shifts_delta={"is": is_d, "lm": lm_d, "bp": bp_d},
         macro_effects=me,
+        signal=signal,
+        signal_reason=signal_reason,
         timestamp=datetime.now().isoformat(),
     )
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, description="FXに関する質問・相談")
+
+
+@app.post("/api/chat")
+async def chat_fx(req: ChatRequest) -> dict[str, str]:
+    """FXに関する質問・相談に回答する汎用チャットエンドポイント"""
+    answer = await asyncio.to_thread(fx_chat_response, req.message.strip())
+    return {"answer": answer}
+
+
+@app.get("/api/calendar")
+def read_calendar():
+    return get_today_economic_calendar()
+
+
+# -----------------------------------------------------------------------------
+# トレードエンドポイント
+# -----------------------------------------------------------------------------
+@app.get("/api/trade/chart")
+async def get_trade_chart() -> dict[str, Any]:
+    """USD/JPY の直近2日分・5分足OHLCデータを返す（最大100本）"""
+    try:
+        ticker = yf.Ticker("USDJPY=X")
+        hist = ticker.history(period="2d", interval="5m")
+        candles = []
+        for ts, row in hist.iterrows():
+            candles.append({
+                "date": ts.strftime("%m/%d %H:%M"),
+                "open": round(float(row["Open"]), 3),
+                "high": round(float(row["High"]), 3),
+                "low": round(float(row["Low"]), 3),
+                "close": round(float(row["Close"]), 3),
+            })
+        # 最新100本のみ返す
+        candles = candles[-100:]
+        current_price = candles[-1]["close"] if candles else FALLBACK_USD_JPY
+        return {"candles": candles, "current_price": current_price}
+    except Exception as e:
+        return {"candles": [], "current_price": FALLBACK_USD_JPY, "error": str(e)}
+
+
+@app.get("/api/trade")
+async def get_trade_state() -> dict[str, Any]:
+    """現在のトレード状態（残高・ポジション）を返す"""
+    # 現在のUSD/JPYで含み損益を計算
+    current_price = FALLBACK_USD_JPY
+    try:
+        fx = await asyncio.to_thread(get_exchange_rate, "USDJPY=X")
+        p = fx.get("current_price")
+        if isinstance(p, (int, float)):
+            current_price = float(p)
+    except Exception:
+        pass
+
+    positions_with_pnl = []
+    for pos in _trade_state["positions"]:
+        entry = pos["entry_price"]
+        qty = pos["quantity"]
+        if pos["action"] == "BUY":
+            pnl = (current_price - entry) * qty / entry
+        else:
+            pnl = (entry - current_price) * qty / entry
+        positions_with_pnl.append({**pos, "current_price": current_price, "pnl": round(pnl, 2)})
+
+    total_pnl = sum(p["pnl"] for p in positions_with_pnl)
+
+    return {
+        "balance": round(_trade_state["balance"], 2),
+        "positions": positions_with_pnl,
+        "total_pnl": round(total_pnl, 2),
+        "current_price": current_price,
+    }
+
+
+@app.post("/api/trade")
+async def execute_trade(req: TradeRequest) -> dict[str, Any]:
+    """模擬トレードを実行する（BUY / SELL）"""
+    action = req.action.upper()
+    if action not in ("BUY", "SELL"):
+        raise HTTPException(status_code=400, detail="action は BUY または SELL を指定してください")
+
+    # 現在価格取得
+    current_price = FALLBACK_USD_JPY
+    try:
+        fx = await asyncio.to_thread(get_exchange_rate, "USDJPY=X")
+        p = fx.get("current_price")
+        if isinstance(p, (int, float)):
+            current_price = float(p)
+    except Exception:
+        pass
+
+    cost = req.quantity  # USD建て
+    if cost > _trade_state["balance"]:
+        raise HTTPException(status_code=400, detail=f"残高不足です。残高: ${_trade_state['balance']:.2f}")
+
+    _trade_state["balance"] -= cost
+    position = {
+        "id": str(uuid.uuid4())[:8],
+        "action": action,
+        "quantity": req.quantity,
+        "entry_price": current_price,
+        "entry_time": datetime.now().isoformat(),
+    }
+    _trade_state["positions"].append(position)
+
+    return {
+        "message": f"{action} {req.quantity} USD @ {current_price:.3f} JPY を執行しました",
+        "position": position,
+        "balance": round(_trade_state["balance"], 2),
+    }
+
+
+@app.delete("/api/trade/{position_id}")
+async def close_position(position_id: str) -> dict[str, Any]:
+    """ポジションをクローズして損益を確定する"""
+    pos_idx = next((i for i, p in enumerate(_trade_state["positions"]) if p["id"] == position_id), None)
+    if pos_idx is None:
+        raise HTTPException(status_code=404, detail="指定されたポジションが見つかりません")
+
+    # 現在価格取得
+    current_price = FALLBACK_USD_JPY
+    try:
+        fx = await asyncio.to_thread(get_exchange_rate, "USDJPY=X")
+        p = fx.get("current_price")
+        if isinstance(p, (int, float)):
+            current_price = float(p)
+    except Exception:
+        pass
+
+    pos = _trade_state["positions"].pop(pos_idx)
+    entry = pos["entry_price"]
+    qty = pos["quantity"]
+
+    if pos["action"] == "BUY":
+        pnl = (current_price - entry) * qty / entry
+    else:
+        pnl = (entry - current_price) * qty / entry
+
+    _trade_state["balance"] += qty + pnl  # 証拠金返却 + 損益
+
+    return {
+        "message": f"ポジション {position_id} をクローズしました",
+        "pnl": round(pnl, 2),
+        "close_price": current_price,
+        "balance": round(_trade_state["balance"], 2),
+    }
+
+
+@app.post("/api/trade/reset")
+async def reset_trade() -> dict[str, Any]:
+    """トレード状態をリセットする（初期残高に戻す）"""
+    _trade_state["balance"] = INITIAL_BALANCE
+    _trade_state["positions"] = []
+    return {"message": "トレード状態をリセットしました", "balance": INITIAL_BALANCE}
+
 
 if __name__ == "__main__":
     # 環境変数 PORT があればそれを使い、なければ 8000 を使う（ローカル用）
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
-@app.get("/api/calendar")
-def read_calendar():
-    return get_today_economic_calendar()

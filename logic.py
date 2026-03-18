@@ -40,25 +40,30 @@ LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY")
 LANGFUSE_HOST = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
 
 if not GEMINI_API_KEY:
-    raise ValueError(
+    logger.warning(
         "GEMINI_API_KEY が設定されていません。"
         ".env ファイルに GEMINI_API_KEY を追加してください。"
     )
 
 if not LANGFUSE_PUBLIC_KEY or not LANGFUSE_SECRET_KEY:
-    raise ValueError(
+    logger.warning(
         "Langfuse の認証情報が不足しています。"
         ".env に LANGFUSE_PUBLIC_KEY と LANGFUSE_SECRET_KEY を設定してください。"
+        "トレーシングは無効化されます。"
     )
 
-# Gemini クライアント
-genai_client = genai.Client(api_key=GEMINI_API_KEY)
+# Gemini クライアント（キー未設定時は None、呼び出し時にエラー）
+genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-# Langfuse クライアント（トレーシング用）
-langfuse = Langfuse(
-    public_key=LANGFUSE_PUBLIC_KEY,
-    secret_key=LANGFUSE_SECRET_KEY,
-    host=LANGFUSE_HOST,
+# Langfuse クライアント（認証情報未設定時は None）
+langfuse = (
+    Langfuse(
+        public_key=LANGFUSE_PUBLIC_KEY,
+        secret_key=LANGFUSE_SECRET_KEY,
+        host=LANGFUSE_HOST,
+    )
+    if LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY
+    else None
 )
 
 # -----------------------------------------------------------------------------
@@ -66,7 +71,7 @@ langfuse = Langfuse(
 # -----------------------------------------------------------------------------
 MACRO_IMPACT_SCHEMA = {
     "type": "object",
-    "required": ["is_shift", "lm_shift", "bp_shift", "logic_jp"],
+    "required": ["is_shift", "lm_shift", "bp_shift", "logic_jp", "signal", "signal_reason"],
     "properties": {
         "is_shift": {
             "type": "number",
@@ -99,6 +104,15 @@ MACRO_IMPACT_SCHEMA = {
                 "capital_flow": {"type": "string", "description": "資本フローへの影響 e.g. Inflow, Outflow, Neutral"},
             },
         },
+        "signal": {
+            "type": "string",
+            "description": "USD/JPYの売買シグナル。BUY=ドル買い・円売り（円安予測）、SELL=ドル売り・円買い（円高予測）、HOLD=様子見",
+            "enum": ["BUY", "SELL", "HOLD"],
+        },
+        "signal_reason": {
+            "type": "string",
+            "description": "シグナルの根拠（日本語で簡潔に）。IS-LM-BPのシフト方向と為替への影響を踏まえた判断理由。",
+        },
     },
 }
 
@@ -107,6 +121,10 @@ SYSTEM_INSTRUCTION = (
     "入力されたニュースについて、マンデル＝フレミング・モデルにおける"
     "IS曲線・LM曲線・BP曲線への影響を分析し、指定されたJSON形式で出力してください。"
     "【重要】LM曲線: FRB利上げ・金融引き締めのときは必ず 'left'（左シフト）。利下げ・金融緩和のときは 'right'（右シフト）。"
+    "【シグナル判定ルール】USD/JPYの売買シグナルを以下のロジックで判定してください："
+    "BUY（ドル買い・円安予測）: IS右シフト＋BP上シフト→資本流入・円安圧力、またはFRB利上げ→日米金利差拡大→円安。"
+    "SELL（ドル売り・円高予測）: IS左シフト＋BP下シフト→資本流出・円高圧力、またはFRB利下げ→日米金利差縮小→円高、またはBOJ利上げ期待→円高。"
+    "HOLD: IS・LM・BP変化が小さい、または相反するシグナルで判断困難なとき。"
 )
 
 USER_PROMPT_TEMPLATE = """
@@ -413,6 +431,11 @@ def generate_analysis_prompt(
     parts.append("- bp_shift: 数値（-10〜10）。上=正、下=負、なし=0。")
     parts.append("- logic_jp: 日本語での詳細な経済学的解説。IS-LM-BPのどれがなぜ動いたか、利子率と為替への影響を説明。")
     parts.append("- macro_effects: exchange_rate, interest_rate, output, capital_flow を英語で簡潔に（Appreciation/Depreciation/Neutral, Increase/Decrease/Neutral, Expand/Contract/Neutral, Inflow/Outflow/Neutral）。")
+    parts.append("- signal: \"BUY\"（ドル買い・円安予測）、\"SELL\"（ドル売り・円高予測）、\"HOLD\"（様子見）のいずれか。")
+    parts.append("  BUY条件: IS右シフト＋BP上シフト（資本流入→円安）、またはFRB利上げ（日米金利差拡大→円安）。")
+    parts.append("  SELL条件: IS左シフト＋BP下シフト（資本流出→円高）、またはFRB利下げ（金利差縮小→円高）、またはBOJ利上げ（円高）。")
+    parts.append("  HOLD条件: シフト量が小さい（絶対値<1）または相反するシグナル。")
+    parts.append("- signal_reason: シグナルの根拠を日本語で1〜2文で。")
     return "\n".join(parts)
 
 
@@ -439,6 +462,9 @@ def analyze_macro_impact(news_text: str) -> dict:
     """
     if not news_text or not news_text.strip():
         raise ValueError("news_text が空です。分析対象のニュースを入力してください。")
+
+    if not genai_client:
+        raise RuntimeError("GEMINI_API_KEY が設定されていないため分析できません。")
 
     user_prompt = USER_PROMPT_TEMPLATE.format(news_text=news_text.strip())
 
@@ -478,8 +504,31 @@ def analyze_macro_impact(news_text: str) -> dict:
             f"応答内容: {result}"
         )
 
+    def clamp_shift(v: Any) -> float:
+        try:
+            n = float(v)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(-10.0, min(10.0, n))
+
+    def lm_direction_to_numeric(lm_val: Any) -> float:
+        """LM曲線: left=正（左シフト）、right=負（右シフト）、neutral=0"""
+        s = str(lm_val).strip().lower() if lm_val is not None else ""
+        mag = clamp_shift(result.get("lm_shift_magnitude", 5))
+        mag = max(0.5, mag)
+        if s == "left":
+            return mag
+        if s == "right":
+            return -mag
+        return 0.0
+
+    result["is_shift"] = clamp_shift(result.get("is_shift", 0))
+    result["lm_shift"] = lm_direction_to_numeric(result.get("lm_shift"))
+    result["bp_shift"] = clamp_shift(result.get("bp_shift", 0))
+
     # 短命アプリでのトレース送信を確実にする
-    langfuse.flush()
+    if langfuse:
+        langfuse.flush()
 
     return result
 
@@ -498,6 +547,9 @@ def analyze_macro_impact_with_integrated_data(news_text: str) -> dict[str, Any]:
     """
     if not news_text or not news_text.strip():
         raise ValueError("news_text が空です。分析対象のニュースを入力してください。")
+
+    if not genai_client:
+        raise RuntimeError("GEMINI_API_KEY が設定されていないため分析できません。")
 
     integrated_data = get_integrated_market_data()
     user_prompt = generate_analysis_prompt(news_text.strip(), integrated_data)
@@ -559,12 +611,45 @@ def analyze_macro_impact_with_integrated_data(news_text: str) -> dict[str, Any]:
     result["lm_shift"] = lm_direction_to_numeric(result.get("lm_shift"))
     result["bp_shift"] = clamp_shift(result.get("bp_shift", 0))
 
-    langfuse.flush()
+    if langfuse:
+        langfuse.flush()
 
     return {
         "analysis": result,
         "economic_calendar": integrated_data.get("economic_calendar", []),
     }
+
+
+def fx_chat_response(message: str) -> str:
+    """
+    FXに関する質問・相談に日本語で回答する。
+    """
+    system = (
+        "あなたはFX（外国為替取引）の専門家アドバイザーです。"
+        "ユーザーのFXに関するあらゆる質問・相談に日本語でわかりやすく答えてください。"
+        "具体的な数値や例を挙げながら説明し、初心者にも理解できるよう丁寧に解説してください。"
+        "USD/JPYを中心に、相場の読み方、ローソク足の見方、トレード手法、"
+        "リスク管理、経済指標の見方、IS-LM-BPモデルの説明なども対応してください。"
+        "回答は400字以内で簡潔にまとめてください。"
+    )
+    if not genai_client:
+        return "GEMINI_API_KEY が設定されていないため回答できません。"
+    try:
+        response = genai_client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=message,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                temperature=0.5,
+                max_output_tokens=600,
+            ),
+        )
+        if langfuse:
+            langfuse.flush()
+        return response.text or "回答を生成できませんでした。"
+    except Exception as e:
+        logger.warning("fx_chat_response failed: %s", e)
+        return f"申し訳ありません。エラーが発生しました。"
 
 
 # --- ここからテスト用コード ---
