@@ -47,8 +47,18 @@ app = FastAPI(
 
 # 許可するオリジンを環境変数で制御（カンマ区切り）
 # 例: ALLOWED_ORIGINS=https://mundel.vercel.app,https://mundel-preview.vercel.app
-_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
-ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+#
+# ALLOWED_ORIGINS が未設定の場合:
+#   - Cloud Run 上 (K_SERVICE が設定済み): すべてのオリジンを許可
+#   - ローカル開発: http://localhost:3000 のみ許可
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "")
+if _raw_origins.strip():
+    ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+elif os.getenv("K_SERVICE"):
+    # Cloud Run 上で ALLOWED_ORIGINS 未設定 → 全許可（後で制限推奨）
+    ALLOWED_ORIGINS = ["*"]
+else:
+    ALLOWED_ORIGINS = ["http://localhost:3000"]
 
 app.add_middleware(
     CORSMiddleware,
