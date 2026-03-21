@@ -7,14 +7,19 @@ FastAPI でフロントエンド（v0 / React / Next.js）と接続する。
 
 import asyncio
 from datetime import datetime
+import json
+import logging
+import sqlite3
 from typing import Any
 import uuid
+
+logger = logging.getLogger(__name__)
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from data_fetcher import get_exchange_rate, get_macro_indicators
+from data_fetcher import DATA_DIR, DB_PATH, get_exchange_rate, get_macro_indicators
 from logic import (
     FALLBACK_US_CPI_YOY,
     FALLBACK_US_POLICY_RATE,
@@ -40,10 +45,14 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# v0 / React / Next.js からのアクセスを許可
+# 許可するオリジンを環境変数で制御（カンマ区切り）
+# 例: ALLOWED_ORIGINS=https://mundel.vercel.app,https://mundel-preview.vercel.app
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
+ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 本番では特定オリジンに制限推奨
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -102,14 +111,109 @@ class AnalyzeResponse(BaseModel):
 
 
 # -----------------------------------------------------------------------------
-# トレード状態（インメモリ）
+# 共通ヘルパー: 市場データ整形
+# -----------------------------------------------------------------------------
+def _build_market_data(exchange_result: Any, macro_result: Any) -> dict[str, Any]:
+    """為替・マクロ指標の取得結果を統一フォーマットに整形する"""
+    market_data: dict[str, Any] = {"exchange": {}, "indicators": {}, "errors": []}
+
+    if isinstance(exchange_result, Exception):
+        market_data["errors"].append(f"為替データ: {exchange_result}")
+    else:
+        market_data["exchange"] = {
+            "pair": exchange_result.get("pair", "USDJPY=X"),
+            "current_price": exchange_result.get("current_price"),
+            "closes_7d": exchange_result.get("closes_7d", []),
+            "error": exchange_result.get("error"),
+        }
+
+    if isinstance(macro_result, Exception):
+        market_data["errors"].append(f"マクロ指標: {macro_result}")
+    else:
+        indicators = macro_result.get("indicators", {})
+        market_data["indicators"] = {
+            "us_policy_rate": indicators.get("FEDFUNDS", {}).get("latest_value"),
+            "us_cpi": indicators.get("CPIAUCSL", {}).get("latest_value"),
+            "jp_policy_rate": indicators.get("IRSTCB01JPM156N", {}).get("latest_value"),
+            "jp_cpi": indicators.get("JPNCPIALLMINMEI", {}).get("latest_value"),
+            "raw": indicators,
+        }
+        if macro_result.get("error"):
+            market_data["errors"].append(macro_result["error"])
+
+    return market_data
+
+
+def _build_te_macro(te_snapshot_result: Any) -> dict[str, Any]:
+    """Trading Economics スナップショットの取得結果を統一フォーマットに整形する"""
+    if isinstance(te_snapshot_result, Exception):
+        return {
+            "usd_jpy": FALLBACK_USD_JPY,
+            "us_policy_rate": FALLBACK_US_POLICY_RATE,
+            "us_cpi_yoy": FALLBACK_US_CPI_YOY,
+            "errors": [str(te_snapshot_result)],
+        }
+    return {
+        "usd_jpy": te_snapshot_result.get("usd_jpy", FALLBACK_USD_JPY),
+        "us_policy_rate": te_snapshot_result.get("us_policy_rate", FALLBACK_US_POLICY_RATE),
+        "us_cpi_yoy": te_snapshot_result.get("us_cpi_yoy", FALLBACK_US_CPI_YOY),
+        "usd_jpy_source": te_snapshot_result.get("usd_jpy_source"),
+        "us_policy_rate_source": te_snapshot_result.get("us_policy_rate_source"),
+        "us_cpi_yoy_source": te_snapshot_result.get("us_cpi_yoy_source"),
+        "errors": te_snapshot_result.get("errors", []),
+    }
+
+
+# -----------------------------------------------------------------------------
+# トレード状態（SQLite 永続化）
 # -----------------------------------------------------------------------------
 INITIAL_BALANCE = 10000.0
 
-_trade_state: dict[str, Any] = {
-    "balance": INITIAL_BALANCE,
-    "positions": [],
-}
+
+def _get_trade_db() -> sqlite3.Connection:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS trade_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def _load_trade_state() -> dict[str, Any]:
+    try:
+        conn = _get_trade_db()
+        rows = dict(conn.execute("SELECT key, value FROM trade_state").fetchall())
+        conn.close()
+        return {
+            "balance": float(rows.get("balance", INITIAL_BALANCE)),
+            "positions": json.loads(rows.get("positions", "[]")),
+        }
+    except Exception as e:
+        logger.warning("トレード状態の読み込みに失敗しました: %s", e)
+        return {"balance": INITIAL_BALANCE, "positions": []}
+
+
+def _save_trade_state(state: dict[str, Any]) -> None:
+    try:
+        conn = _get_trade_db()
+        conn.execute(
+            "INSERT OR REPLACE INTO trade_state (key, value) VALUES (?, ?)",
+            ("balance", str(state["balance"])),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO trade_state (key, value) VALUES (?, ?)",
+            ("positions", json.dumps(state["positions"], ensure_ascii=False)),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning("トレード状態の保存に失敗しました: %s", e)
 
 
 class TradeRequest(BaseModel):
@@ -145,57 +249,9 @@ async def get_analysis() -> dict[str, Any]:
         return_exceptions=True,
     )
 
-    market_data: dict[str, Any] = {
-        "exchange": {},
-        "indicators": {},
-        "errors": [],
-    }
-
-    if isinstance(exchange_result, Exception):
-        market_data["errors"].append(f"為替データ: {exchange_result}")
-    else:
-        market_data["exchange"] = {
-            "pair": exchange_result.get("pair", "USDJPY=X"),
-            "current_price": exchange_result.get("current_price"),
-            "closes_7d": exchange_result.get("closes_7d", []),
-            "error": exchange_result.get("error"),
-        }
-
-    if isinstance(macro_result, Exception):
-        market_data["errors"].append(f"マクロ指標: {macro_result}")
-    else:
-        indicators = macro_result.get("indicators", {})
-        market_data["indicators"] = {
-            "us_policy_rate": indicators.get("FEDFUNDS", {}).get("latest_value"),
-            "us_cpi": indicators.get("CPIAUCSL", {}).get("latest_value"),
-            "jp_policy_rate": indicators.get("IRSTCB01JPM156N", {}).get("latest_value"),
-            "jp_cpi": indicators.get("JPNCPIALLMINMEI", {}).get("latest_value"),
-            "raw": indicators,
-        }
-        if macro_result.get("error"):
-            market_data["errors"].append(macro_result["error"])
-
-    if isinstance(te_snapshot_result, Exception):
-        te_macro = {
-            "usd_jpy": FALLBACK_USD_JPY,
-            "us_policy_rate": FALLBACK_US_POLICY_RATE,
-            "us_cpi_yoy": FALLBACK_US_CPI_YOY,
-            "errors": [str(te_snapshot_result)],
-        }
-    else:
-        te_macro = {
-            "usd_jpy": te_snapshot_result.get("usd_jpy", FALLBACK_USD_JPY),
-            "us_policy_rate": te_snapshot_result.get("us_policy_rate", FALLBACK_US_POLICY_RATE),
-            "us_cpi_yoy": te_snapshot_result.get("us_cpi_yoy", FALLBACK_US_CPI_YOY),
-            "usd_jpy_source": te_snapshot_result.get("usd_jpy_source"),
-            "us_policy_rate_source": te_snapshot_result.get("us_policy_rate_source"),
-            "us_cpi_yoy_source": te_snapshot_result.get("us_cpi_yoy_source"),
-            "errors": te_snapshot_result.get("errors", []),
-        }
-
     return {
-        "market_data": market_data,
-        "te_macro_snapshot": te_macro,
+        "market_data": _build_market_data(exchange_result, macro_result),
+        "te_macro_snapshot": _build_te_macro(te_snapshot_result),
         "timestamp": datetime.now().isoformat(),
     }
 
@@ -228,55 +284,8 @@ async def analyze(news: AnalyzeRequest) -> AnalyzeResponse:
         economic_calendar = analysis_result.get("economic_calendar", [])
 
     # 市場データの統合
-    market_data: dict[str, Any] = {
-        "exchange": {},
-        "indicators": {},
-        "errors": [],
-    }
-
-    if isinstance(exchange_result, Exception):
-        market_data["errors"].append(f"為替データ: {exchange_result}")
-    else:
-        market_data["exchange"] = {
-            "pair": exchange_result.get("pair", "USDJPY=X"),
-            "current_price": exchange_result.get("current_price"),
-            "closes_7d": exchange_result.get("closes_7d", []),
-            "error": exchange_result.get("error"),
-        }
-
-    if isinstance(macro_result, Exception):
-        market_data["errors"].append(f"マクロ指標: {macro_result}")
-    else:
-        indicators = macro_result.get("indicators", {})
-        market_data["indicators"] = {
-            "us_policy_rate": indicators.get("FEDFUNDS", {}).get("latest_value"),
-            "us_cpi": indicators.get("CPIAUCSL", {}).get("latest_value"),
-            "jp_policy_rate": indicators.get("IRSTCB01JPM156N", {}).get("latest_value"),
-            "jp_cpi": indicators.get("JPNCPIALLMINMEI", {}).get("latest_value"),
-            "raw": indicators,
-        }
-        if macro_result.get("error"):
-            market_data["errors"].append(macro_result["error"])
-
-    # Trading Economics マクロスナップショット（USD/JPY, 米政策金利, 米CPI YoY）
-    te_macro: dict[str, Any] = {}
-    if isinstance(te_snapshot_result, Exception):
-        te_macro = {
-            "usd_jpy": FALLBACK_USD_JPY,
-            "us_policy_rate": FALLBACK_US_POLICY_RATE,
-            "us_cpi_yoy": FALLBACK_US_CPI_YOY,
-            "errors": [str(te_snapshot_result)],
-        }
-    else:
-        te_macro = {
-            "usd_jpy": te_snapshot_result.get("usd_jpy", FALLBACK_USD_JPY),
-            "us_policy_rate": te_snapshot_result.get("us_policy_rate", FALLBACK_US_POLICY_RATE),
-            "us_cpi_yoy": te_snapshot_result.get("us_cpi_yoy", FALLBACK_US_CPI_YOY),
-            "usd_jpy_source": te_snapshot_result.get("usd_jpy_source"),
-            "us_policy_rate_source": te_snapshot_result.get("us_policy_rate_source"),
-            "us_cpi_yoy_source": te_snapshot_result.get("us_cpi_yoy_source"),
-            "errors": te_snapshot_result.get("errors", []),
-        }
+    market_data = _build_market_data(exchange_result, macro_result)
+    te_macro = _build_te_macro(te_snapshot_result)
 
     # 均衡点 E0（現在）と E1（シフト後予測）を算出（必ず数値で返す）
     def to_float(v: Any, default: float = 0.0) -> float:
@@ -388,7 +397,7 @@ async def get_trade_chart() -> dict[str, Any]:
 @app.get("/api/trade")
 async def get_trade_state() -> dict[str, Any]:
     """現在のトレード状態（残高・ポジション）を返す"""
-    # 現在のUSD/JPYで含み損益を計算
+    state = _load_trade_state()
     current_price = FALLBACK_USD_JPY
     try:
         fx = await asyncio.to_thread(get_exchange_rate, "USDJPY=X")
@@ -399,7 +408,7 @@ async def get_trade_state() -> dict[str, Any]:
         pass
 
     positions_with_pnl = []
-    for pos in _trade_state["positions"]:
+    for pos in state["positions"]:
         entry = pos["entry_price"]
         qty = pos["quantity"]
         if pos["action"] == "BUY":
@@ -411,7 +420,7 @@ async def get_trade_state() -> dict[str, Any]:
     total_pnl = sum(p["pnl"] for p in positions_with_pnl)
 
     return {
-        "balance": round(_trade_state["balance"], 2),
+        "balance": round(state["balance"], 2),
         "positions": positions_with_pnl,
         "total_pnl": round(total_pnl, 2),
         "current_price": current_price,
@@ -435,11 +444,12 @@ async def execute_trade(req: TradeRequest) -> dict[str, Any]:
     except Exception:
         pass
 
+    state = _load_trade_state()
     cost = req.quantity  # USD建て
-    if cost > _trade_state["balance"]:
-        raise HTTPException(status_code=400, detail=f"残高不足です。残高: ${_trade_state['balance']:.2f}")
+    if cost > state["balance"]:
+        raise HTTPException(status_code=400, detail=f"残高不足です。残高: ${state['balance']:.2f}")
 
-    _trade_state["balance"] -= cost
+    state["balance"] -= cost
     position = {
         "id": str(uuid.uuid4())[:8],
         "action": action,
@@ -447,19 +457,21 @@ async def execute_trade(req: TradeRequest) -> dict[str, Any]:
         "entry_price": current_price,
         "entry_time": datetime.now().isoformat(),
     }
-    _trade_state["positions"].append(position)
+    state["positions"].append(position)
+    _save_trade_state(state)
 
     return {
         "message": f"{action} {req.quantity} USD @ {current_price:.3f} JPY を執行しました",
         "position": position,
-        "balance": round(_trade_state["balance"], 2),
+        "balance": round(state["balance"], 2),
     }
 
 
 @app.delete("/api/trade/{position_id}")
 async def close_position(position_id: str) -> dict[str, Any]:
     """ポジションをクローズして損益を確定する"""
-    pos_idx = next((i for i, p in enumerate(_trade_state["positions"]) if p["id"] == position_id), None)
+    state = _load_trade_state()
+    pos_idx = next((i for i, p in enumerate(state["positions"]) if p["id"] == position_id), None)
     if pos_idx is None:
         raise HTTPException(status_code=404, detail="指定されたポジションが見つかりません")
 
@@ -473,7 +485,7 @@ async def close_position(position_id: str) -> dict[str, Any]:
     except Exception:
         pass
 
-    pos = _trade_state["positions"].pop(pos_idx)
+    pos = state["positions"].pop(pos_idx)
     entry = pos["entry_price"]
     qty = pos["quantity"]
 
@@ -482,21 +494,21 @@ async def close_position(position_id: str) -> dict[str, Any]:
     else:
         pnl = (entry - current_price) * qty / entry
 
-    _trade_state["balance"] += qty + pnl  # 証拠金返却 + 損益
+    state["balance"] += qty + pnl  # 証拠金返却 + 損益
+    _save_trade_state(state)
 
     return {
         "message": f"ポジション {position_id} をクローズしました",
         "pnl": round(pnl, 2),
         "close_price": current_price,
-        "balance": round(_trade_state["balance"], 2),
+        "balance": round(state["balance"], 2),
     }
 
 
 @app.post("/api/trade/reset")
 async def reset_trade() -> dict[str, Any]:
     """トレード状態をリセットする（初期残高に戻す）"""
-    _trade_state["balance"] = INITIAL_BALANCE
-    _trade_state["positions"] = []
+    _save_trade_state({"balance": INITIAL_BALANCE, "positions": []})
     return {"message": "トレード状態をリセットしました", "balance": INITIAL_BALANCE}
 
 
